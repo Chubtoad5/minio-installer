@@ -1,6 +1,6 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
-# MinIO single-node installer using Docker
+# MinIO single-node installer using Docker Compose
 # Inspired by: install-harbor.sh framework
 #
 
@@ -9,12 +9,15 @@
 DEBUG=${DEBUG:-1}
 
 # MinIO container version/tag
-MINIO_VERSION=${MINIO_VERSION:-"latest"}     # e.g., "latest" or "RELEASE.2024-01-20T01-00-00Z"
+MINIO_VERSION=${MINIO_VERSION:-"latest"}        # e.g. "latest" or a specific release
 
 # Service identity / TLS
 MINIO_FQDN=${MINIO_FQDN:-"minio.edge.lab"}
-BIND_ADDRESS=${BIND_ADDRESS:-"$(hostname -I | awk '{print $1}')"}  # local IP to bind / advertise
 
+# Bind address for local host (for dual-homed systems, etc.)
+BIND_ADDRESS=${BIND_ADDRESS:-"$(hostname -I | awk '{print $1}')"}  # IP to bind and use in SAN
+
+# Certificate subject
 COUNTRY=${COUNTRY:-"US"}
 STATE=${STATE:-"MA"}
 LOCATION=${LOCATION:-"BOSTON"}
@@ -34,12 +37,12 @@ MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT:-"9001"}
 
 # Paths
 MINIO_BASE_DIR=${MINIO_BASE_DIR:-"/opt/minio"}
-MINIO_DATA_DIR="${MINIO_DATA_DIR:-"$MINIO_BASE_DIR/data"}"
-MINIO_CERT_DIR="${MINIO_CERT_DIR:-"$MINIO_BASE_DIR/certs"}"
+MINIO_DATA_DIR=${MINIO_DATA_DIR:-"$MINIO_BASE_DIR/data"}
+MINIO_CERT_DIR=${MINIO_CERT_DIR:-"$MINIO_BASE_DIR/certs"}
+MINIO_COMPOSE_FILE=${MINIO_COMPOSE_FILE:-"$MINIO_BASE_DIR/docker-compose.yml"}
 
 # Container names
 MINIO_CONTAINER_NAME=${MINIO_CONTAINER_NAME:-"minio-server"}
-MINIO_MC_CONTAINER_NAME=${MINIO_MC_CONTAINER_NAME:-"minio-mc"}
 
 # --- INTERNAL VARIABLES (do not edit) --- #
 
@@ -78,10 +81,19 @@ check_docker_installed() {
   fi
 }
 
-# --- DNS Validation --- #
+get_compose_cmd() {
+  if docker compose version >/dev/null 2>&1; then
+    echo "docker compose"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    echo "docker-compose"
+  else
+    echo "Error: docker compose (plugin) or docker-compose (standalone) is required." >&2
+    return 1
+  fi
+}
 
 validate_dns() {
-  echo "Validating DNS for '$MINIO_FQDN' against local bind address '$BIND_ADDRESS'..."
+  echo "Validating DNS for '$MINIO_FQDN' against bind address '$BIND_ADDRESS'..."
   local dns_ip
   dns_ip=$(getent ahosts "$MINIO_FQDN" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
 
@@ -91,7 +103,7 @@ validate_dns() {
   fi
 
   if [[ "$dns_ip" != "$BIND_ADDRESS" ]]; then
-    echo "WARNING: DNS for '$MINIO_FQDN' resolves to '$dns_ip' but local bind address is '$BIND_ADDRESS'."
+    echo "WARNING: DNS for '$MINIO_FQDN' resolves to '$dns_ip' but bind address is '$BIND_ADDRESS'."
     echo "Clients may not be able to reach MinIO using the configured FQDN."
   else
     echo "DNS validation successful: '$MINIO_FQDN' -> '$dns_ip'."
@@ -104,7 +116,7 @@ generate_certs() {
   echo "Creating self-signed certificate valid for $DURATION_DAYS days..."
   mkdir -p "$MINIO_CERT_DIR"
 
-  # CA key + cert (optional, mainly for future use)
+  # CA key + cert (for completeness, MinIO uses public/private only)
   openssl genrsa -out "$MINIO_CERT_DIR/ca.key" 4096
   openssl req -x509 -new -nodes -sha512 -days "$DURATION_DAYS" \
     -subj "/C=$COUNTRY/ST=$STATE/L=$LOCATION/O=$ORGANIZATION/CN=$MINIO_FQDN" \
@@ -129,12 +141,12 @@ extendedKeyUsage = serverAuth
 subjectAltName = @alt_names
 
 [alt_names]
-IP.1 = $BIND_ADDRESS
 DNS.1 = $MINIO_FQDN
 DNS.2 = $current_hostname
+IP.1  = $BIND_ADDRESS
 EOF
 
-  # Signed cert
+  # Signed cert -> public.crt (MinIO requires /certs/public.crt and /certs/private.key)
   openssl x509 -req -sha512 -days "$DURATION_DAYS" \
     -extfile "$MINIO_CERT_DIR/v3.ext" \
     -CA "$MINIO_CERT_DIR/ca.crt" \
@@ -146,57 +158,83 @@ EOF
   echo "Certificate generation completed."
 }
 
-# --- MinIO Container Management --- #
+# --- Docker Compose Configuration --- #
 
-run_minio_container() {
-  echo "Starting MinIO container '$MINIO_CONTAINER_NAME'..."
+generate_compose_file() {
+  echo "Generating docker-compose.yml at $MINIO_COMPOSE_FILE ..."
+  mkdir -p "$MINIO_BASE_DIR"
 
-  mkdir -p "$MINIO_DATA_DIR" "$MINIO_CERT_DIR"
+  cat >"$MINIO_COMPOSE_FILE" <<EOF
+version: "3.9"
 
-  # Remove existing container if present
-  if docker ps -a --format '{{.Names}}' | grep -q "^${MINIO_CONTAINER_NAME}\$"; then
-    echo "Found existing container '$MINIO_CONTAINER_NAME', stopping and removing..."
-    docker stop "$MINIO_CONTAINER_NAME" >/dev/null 2>&1 || true
-    docker rm "$MINIO_CONTAINER_NAME" >/dev/null 2>&1 || true
-  fi
-
-  local server_url="https://$MINIO_FQDN:$MINIO_S3_PORT"
-  local console_url="https://$MINIO_FQDN:$MINIO_CONSOLE_PORT"
-
-  docker run -d \
-    --name "$MINIO_CONTAINER_NAME" \
-    --restart=unless-stopped \
-    -p "$BIND_ADDRESS:$MINIO_S3_PORT:9000" \
-    -p "$BIND_ADDRESS:$MINIO_CONSOLE_PORT:9001" \
-    -e MINIO_ROOT_USER="$MINIO_ROOT_USER" \
-    -e MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
-    -e MINIO_SERVER_URL="$server_url" \
-    -e MINIO_BROWSER_REDIRECT_URL="$console_url" \
-    -v "$MINIO_DATA_DIR:/data" \
-    -v "$MINIO_CERT_DIR:/certs" \
-    "minio/minio:${MINIO_VERSION}" \
-    server /data \
-    --console-address ":9001" \
-    --address ":9000"
-
-  echo "MinIO container started."
+services:
+  minio:
+    image: minio/minio:${MINIO_VERSION}
+    container_name: ${MINIO_CONTAINER_NAME}
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
+      MINIO_SERVER_URL: "https://${MINIO_FQDN}:${MINIO_S3_PORT}"
+      MINIO_BROWSER_REDIRECT_URL: "https://${MINIO_FQDN}:${MINIO_CONSOLE_PORT}"
+    ports:
+      - "${BIND_ADDRESS}:${MINIO_S3_PORT}:9000"
+      - "${BIND_ADDRESS}:${MINIO_CONSOLE_PORT}:9001"
+    volumes:
+      - "${MINIO_DATA_DIR}:/data"
+      - "${MINIO_CERT_DIR}:/certs"
+EOF
 }
 
+start_minio_compose() {
+  local compose_cmd
+  compose_cmd=$(get_compose_cmd) || exit 1
+
+  mkdir -p "$MINIO_DATA_DIR"
+  mkdir -p "$MINIO_CERT_DIR"
+
+  if [[ -d "$MINIO_DATA_DIR/.minio.sys" ]]; then
+    echo "NOTE: Existing MinIO data directory detected at '$MINIO_DATA_DIR'."
+    echo "      Existing credentials/config will be preserved. New MINIO_ROOT_USER/PASSWORD may be ignored."
+  fi
+
+  echo "Starting MinIO using Docker Compose..."
+  (cd "$MINIO_BASE_DIR" && $compose_cmd up -d)
+}
+
+stop_minio_compose() {
+  local compose_cmd
+  compose_cmd=$(get_compose_cmd) || return 0
+
+  if [[ -f "$MINIO_COMPOSE_FILE" ]]; then
+    echo "Stopping MinIO using Docker Compose..."
+    (cd "$MINIO_BASE_DIR" && $compose_cmd down || true)
+  fi
+}
+
+# --- Health Check --- #
+
 wait_for_minio() {
-  echo "Waiting for MinIO to become ready..."
+  echo "Waiting for MinIO to become ready (HTTPS)..."
   local retries=60
   local delay=5
   local i=0
 
-  local health_url="https://$MINIO_FQDN:$MINIO_CONSOLE_PORT/api/v1/login"
+  # Health endpoint: /minio/health/ready on S3 port
+  local health_url="https://${MINIO_FQDN}:${MINIO_S3_PORT}/minio/health/ready"
 
   while ((i < retries)); do
-    if curl -k -s -o /dev/null -w "%{http_code}" "$health_url" | grep -qE '200|405|401'; then
-      echo "MinIO appears to be responding."
+    local code
+    code=$(curl -k -s -o /dev/null -w "%{http_code}" "$health_url" || echo "000")
+
+    if [[ "$code" == "200" ]]; then
+      echo "MinIO reports ready (HTTP $code)."
       return 0
     fi
+
     i=$((i + 1))
-    echo "  Attempt $i/$retries: MinIO not ready yet, retrying in ${delay}s..."
+    echo "  Attempt $i/$retries: MinIO not ready yet (HTTP $code), retrying in ${delay}s..."
     sleep "$delay"
   done
 
@@ -205,31 +243,22 @@ wait_for_minio() {
 
 # --- MinIO Client (mc) and Bucket Creation --- #
 
-ensure_mc_image() {
-  # No-op placeholder if we want to validate image existence later.
-  # For now, docker will pull minio/mc as needed.
-  return 0
-}
-
 configure_minio_and_bucket() {
   echo "Configuring MinIO with default bucket '$MINIO_DEFAULT_BUCKET'..."
-
-  ensure_mc_image
+  local s3_url="https://${MINIO_FQDN}:${MINIO_S3_PORT}"
 
   # Remove any stale mc container
-  if docker ps -a --format '{{.Names}}' | grep -q "^${MINIO_MC_CONTAINER_NAME}\$"; then
-    docker rm -f "$MINIO_MC_CONTAINER_NAME" >/dev/null 2>&1 || true
+  if docker ps -a --format '{{.Names}}' | grep -q "^minio-mc\$"; then
+    docker rm -f minio-mc >/dev/null 2>&1 || true
   fi
 
-  local s3_url="https://$MINIO_FQDN:$MINIO_S3_PORT"
-
-  # Use a temporary mc container to configure alias + bucket
   docker run --rm \
-    --name "$MINIO_MC_CONTAINER_NAME" \
+    --name minio-mc \
     --entrypoint /bin/sh \
     minio/mc \
     -c "
       set -e
+
       mc alias set local '$s3_url' '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' --insecure >/dev/null 2>&1 || \
         mc alias set local '$s3_url' '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' --api S3v4 --insecure
 
@@ -252,20 +281,22 @@ install_minio() {
   debug_run check_docker_installed
   debug_run validate_dns
   debug_run generate_certs
-  debug_run run_minio_container
+  debug_run generate_compose_file
+  debug_run start_minio_compose
   debug_run wait_for_minio
   debug_run configure_minio_and_bucket
 
-  local console_url="https://$MINIO_FQDN:$MINIO_CONSOLE_PORT"
-  local s3_url="https://$MINIO_FQDN:$MINIO_S3_PORT/$MINIO_DEFAULT_BUCKET"
+  local console_url="https://${MINIO_FQDN}:${MINIO_CONSOLE_PORT}"
+  local s3_url="https://${MINIO_FQDN}:${MINIO_S3_PORT}/${MINIO_DEFAULT_BUCKET}"
 
   echo
   echo "# --- MinIO Installation Completed --- #"
-  echo "  MinIO Version:         minio/minio:${MINIO_VERSION}"
+  echo "  MinIO Image:           minio/minio:${MINIO_VERSION}"
   echo "  Bind Address:          $BIND_ADDRESS"
   echo "  FQDN:                  $MINIO_FQDN"
   echo "  Data Directory:        $MINIO_DATA_DIR"
   echo "  Certificates Directory:$MINIO_CERT_DIR"
+  echo "  Compose File:          $MINIO_COMPOSE_FILE"
   echo
   echo "  Console URL:           $console_url"
   echo "  S3 Endpoint URL:       $s3_url"
@@ -280,18 +311,15 @@ install_minio() {
 uninstall_minio() {
   echo "Uninstalling MinIO..."
 
-  # Stop and remove container
+  stop_minio_compose
+
+  # Remove remaining container if still present
   if docker ps -a --format '{{.Names}}' | grep -q "^${MINIO_CONTAINER_NAME}\$"; then
-    echo "Stopping container '$MINIO_CONTAINER_NAME'..."
-    docker stop "$MINIO_CONTAINER_NAME" >/dev/null 2>&1 || true
-    echo "Removing container '$MINIO_CONTAINER_NAME'..."
-    docker rm "$MINIO_CONTAINER_NAME" >/dev/null 2>&1 || true
-  else
-    echo "No MinIO container named '$MINIO_CONTAINER_NAME' found."
+    echo "Removing MinIO container '$MINIO_CONTAINER_NAME'..."
+    docker rm -f "$MINIO_CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 
-  # Remove data and config
-  echo "Removing data and configuration directories..."
+  echo "Removing MinIO directories under '$MINIO_BASE_DIR'..."
   rm -rf "$MINIO_BASE_DIR"
 
   echo "MinIO uninstallation completed."
@@ -308,8 +336,8 @@ Usage: $0 [parameter]
 
 [Parameters]            | [Description]
 help                    | Display this help message
-install-minio           | Install and configure MinIO
-uninstall-minio         | Uninstall MinIO and remove data
+install-minio           | Install and configure MinIO (Docker Compose)
+uninstall-minio         | Uninstall MinIO and remove data/config
 EOF
 }
 
