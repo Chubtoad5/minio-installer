@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+#
+# MinIO single-node installer using Docker
+# Inspired by: install-harbor.sh framework
+#
+
+# --- User Defined Variables --- #
+
+DEBUG=${DEBUG:-1}
+
+# MinIO container version/tag
+MINIO_VERSION=${MINIO_VERSION:-"latest"}     # e.g., "latest" or "RELEASE.2024-01-20T01-00-00Z"
+
+# Service identity / TLS
+MINIO_FQDN=${MINIO_FQDN:-"minio.edge.lab"}
+BIND_ADDRESS=${BIND_ADDRESS:-"$(hostname -I | awk '{print $1}')"}  # local IP to bind / advertise
+
+COUNTRY=${COUNTRY:-"US"}
+STATE=${STATE:-"MA"}
+LOCATION=${LOCATION:-"BOSTON"}
+ORGANIZATION=${ORGANIZATION:-"SELF"}
+DURATION_DAYS=${DURATION_DAYS:-"3650"}
+
+# MinIO admin credentials
+MINIO_ROOT_USER=${MINIO_ROOT_USER:-"minioadmin"}
+MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-"minioadmin123"}
+
+# Default bucket config
+MINIO_DEFAULT_BUCKET=${MINIO_DEFAULT_BUCKET:-"default-bucket"}
+
+# Ports
+MINIO_S3_PORT=${MINIO_S3_PORT:-"9000"}
+MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT:-"9001"}
+
+# Paths
+MINIO_BASE_DIR=${MINIO_BASE_DIR:-"/opt/minio"}
+MINIO_DATA_DIR="${MINIO_DATA_DIR:-"$MINIO_BASE_DIR/data"}"
+MINIO_CERT_DIR="${MINIO_CERT_DIR:-"$MINIO_BASE_DIR/certs"}"
+
+# Container names
+MINIO_CONTAINER_NAME=${MINIO_CONTAINER_NAME:-"minio-server"}
+MINIO_MC_CONTAINER_NAME=${MINIO_MC_CONTAINER_NAME:-"minio-mc"}
+
+# --- INTERNAL VARIABLES (do not edit) --- #
+
+base_dir=$(pwd)
+user_name=${SUDO_USER:-$(whoami)}
+mgmt_ip=$(hostname -I | awk '{print $1}')
+current_hostname=$(hostname)
+
+# --- Utility Functions --- #
+
+debug_run() {
+  if [ "$DEBUG" -eq 1 ]; then
+    echo "--- DEBUG: Running '$*' ---"
+    "$@"
+    local status=$?
+    echo "--- DEBUG: Finished '$*' with status $status ---"
+    return $status
+  else
+    "$@" >/dev/null 2>&1
+    return $?
+  fi
+}
+
+check_root_privileges() {
+  if [[ $EUID != 0 ]]; then
+    echo "This script must be run with sudo or as the root user."
+    exit 1
+  fi
+}
+
+check_docker_installed() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Error: docker is not installed or not in PATH."
+    echo "Please install Docker before running this script."
+    exit 1
+  fi
+}
+
+# --- DNS Validation --- #
+
+validate_dns() {
+  echo "Validating DNS for '$MINIO_FQDN' against local bind address '$BIND_ADDRESS'..."
+  local dns_ip
+  dns_ip=$(getent ahosts "$MINIO_FQDN" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
+
+  if [[ -z "$dns_ip" ]]; then
+    echo "WARNING: DNS lookup for '$MINIO_FQDN' failed. The name may not be resolvable."
+    return 0
+  fi
+
+  if [[ "$dns_ip" != "$BIND_ADDRESS" ]]; then
+    echo "WARNING: DNS for '$MINIO_FQDN' resolves to '$dns_ip' but local bind address is '$BIND_ADDRESS'."
+    echo "Clients may not be able to reach MinIO using the configured FQDN."
+  else
+    echo "DNS validation successful: '$MINIO_FQDN' -> '$dns_ip'."
+  fi
+}
+
+# --- TLS Certificate Generation --- #
+
+generate_certs() {
+  echo "Creating self-signed certificate valid for $DURATION_DAYS days..."
+  mkdir -p "$MINIO_CERT_DIR"
+
+  # CA key + cert (optional, mainly for future use)
+  openssl genrsa -out "$MINIO_CERT_DIR/ca.key" 4096
+  openssl req -x509 -new -nodes -sha512 -days "$DURATION_DAYS" \
+    -subj "/C=$COUNTRY/ST=$STATE/L=$LOCATION/O=$ORGANIZATION/CN=$MINIO_FQDN" \
+    -key "$MINIO_CERT_DIR/ca.key" \
+    -out "$MINIO_CERT_DIR/ca.crt"
+
+  # Server key
+  openssl genrsa -out "$MINIO_CERT_DIR/private.key" 4096
+
+  # CSR
+  openssl req -sha512 -new \
+    -subj "/C=$COUNTRY/ST=$STATE/L=$LOCATION/O=$ORGANIZATION/CN=$MINIO_FQDN" \
+    -key "$MINIO_CERT_DIR/private.key" \
+    -out "$MINIO_CERT_DIR/minio.csr"
+
+  # v3.ext for SANs
+  cat >"$MINIO_CERT_DIR/v3.ext" <<EOF
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[alt_names]
+IP.1 = $BIND_ADDRESS
+DNS.1 = $MINIO_FQDN
+DNS.2 = $current_hostname
+EOF
+
+  # Signed cert
+  openssl x509 -req -sha512 -days "$DURATION_DAYS" \
+    -extfile "$MINIO_CERT_DIR/v3.ext" \
+    -CA "$MINIO_CERT_DIR/ca.crt" \
+    -CAkey "$MINIO_CERT_DIR/ca.key" \
+    -CAcreateserial \
+    -in "$MINIO_CERT_DIR/minio.csr" \
+    -out "$MINIO_CERT_DIR/public.crt"
+
+  echo "Certificate generation completed."
+}
+
+# --- MinIO Container Management --- #
+
+run_minio_container() {
+  echo "Starting MinIO container '$MINIO_CONTAINER_NAME'..."
+
+  mkdir -p "$MINIO_DATA_DIR" "$MINIO_CERT_DIR"
+
+  # Remove existing container if present
+  if docker ps -a --format '{{.Names}}' | grep -q "^${MINIO_CONTAINER_NAME}\$"; then
+    echo "Found existing container '$MINIO_CONTAINER_NAME', stopping and removing..."
+    docker stop "$MINIO_CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker rm "$MINIO_CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
+
+  local server_url="https://$MINIO_FQDN:$MINIO_S3_PORT"
+  local console_url="https://$MINIO_FQDN:$MINIO_CONSOLE_PORT"
+
+  docker run -d \
+    --name "$MINIO_CONTAINER_NAME" \
+    --restart=unless-stopped \
+    -p "$BIND_ADDRESS:$MINIO_S3_PORT:9000" \
+    -p "$BIND_ADDRESS:$MINIO_CONSOLE_PORT:9001" \
+    -e MINIO_ROOT_USER="$MINIO_ROOT_USER" \
+    -e MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
+    -e MINIO_SERVER_URL="$server_url" \
+    -e MINIO_BROWSER_REDIRECT_URL="$console_url" \
+    -v "$MINIO_DATA_DIR:/data" \
+    -v "$MINIO_CERT_DIR:/certs" \
+    "minio/minio:${MINIO_VERSION}" \
+    server /data \
+    --console-address ":9001" \
+    --address ":9000"
+
+  echo "MinIO container started."
+}
+
+wait_for_minio() {
+  echo "Waiting for MinIO to become ready..."
+  local retries=60
+  local delay=5
+  local i=0
+
+  local health_url="https://$MINIO_FQDN:$MINIO_CONSOLE_PORT/api/v1/login"
+
+  while ((i < retries)); do
+    if curl -k -s -o /dev/null -w "%{http_code}" "$health_url" | grep -qE '200|405|401'; then
+      echo "MinIO appears to be responding."
+      return 0
+    fi
+    i=$((i + 1))
+    echo "  Attempt $i/$retries: MinIO not ready yet, retrying in ${delay}s..."
+    sleep "$delay"
+  done
+
+  echo "WARNING: MinIO did not become healthy within the expected time. mc operations may fail."
+}
+
+# --- MinIO Client (mc) and Bucket Creation --- #
+
+ensure_mc_image() {
+  # No-op placeholder if we want to validate image existence later.
+  # For now, docker will pull minio/mc as needed.
+  return 0
+}
+
+configure_minio_and_bucket() {
+  echo "Configuring MinIO with default bucket '$MINIO_DEFAULT_BUCKET'..."
+
+  ensure_mc_image
+
+  # Remove any stale mc container
+  if docker ps -a --format '{{.Names}}' | grep -q "^${MINIO_MC_CONTAINER_NAME}\$"; then
+    docker rm -f "$MINIO_MC_CONTAINER_NAME" >/dev/null 2>&1 || true
+  fi
+
+  local s3_url="https://$MINIO_FQDN:$MINIO_S3_PORT"
+
+  # Use a temporary mc container to configure alias + bucket
+  docker run --rm \
+    --name "$MINIO_MC_CONTAINER_NAME" \
+    --entrypoint /bin/sh \
+    minio/mc \
+    -c "
+      set -e
+      mc alias set local '$s3_url' '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' --insecure >/dev/null 2>&1 || \
+        mc alias set local '$s3_url' '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' --api S3v4 --insecure
+
+      if ! mc ls local >/dev/null 2>&1; then
+        echo 'ERROR: Failed to connect to MinIO using mc.'
+        exit 1
+      fi
+
+      if ! mc ls local/$MINIO_DEFAULT_BUCKET >/dev/null 2>&1; then
+        mc mb local/$MINIO_DEFAULT_BUCKET --ignore-existing >/dev/null 2>&1 || true
+      fi
+    "
+
+  echo "Default bucket '${MINIO_DEFAULT_BUCKET}' ensured."
+}
+
+# --- Install / Uninstall Routines --- #
+
+install_minio() {
+  debug_run check_docker_installed
+  debug_run validate_dns
+  debug_run generate_certs
+  debug_run run_minio_container
+  debug_run wait_for_minio
+  debug_run configure_minio_and_bucket
+
+  local console_url="https://$MINIO_FQDN:$MINIO_CONSOLE_PORT"
+  local s3_url="https://$MINIO_FQDN:$MINIO_S3_PORT/$MINIO_DEFAULT_BUCKET"
+
+  echo
+  echo "# --- MinIO Installation Completed --- #"
+  echo "  MinIO Version:         minio/minio:${MINIO_VERSION}"
+  echo "  Bind Address:          $BIND_ADDRESS"
+  echo "  FQDN:                  $MINIO_FQDN"
+  echo "  Data Directory:        $MINIO_DATA_DIR"
+  echo "  Certificates Directory:$MINIO_CERT_DIR"
+  echo
+  echo "  Console URL:           $console_url"
+  echo "  S3 Endpoint URL:       $s3_url"
+  echo
+  echo "  Admin User:            $MINIO_ROOT_USER"
+  echo "  Admin Password:        $MINIO_ROOT_PASSWORD"
+  echo
+  echo "  Default Bucket:        $MINIO_DEFAULT_BUCKET"
+  echo
+}
+
+uninstall_minio() {
+  echo "Uninstalling MinIO..."
+
+  # Stop and remove container
+  if docker ps -a --format '{{.Names}}' | grep -q "^${MINIO_CONTAINER_NAME}\$"; then
+    echo "Stopping container '$MINIO_CONTAINER_NAME'..."
+    docker stop "$MINIO_CONTAINER_NAME" >/dev/null 2>&1 || true
+    echo "Removing container '$MINIO_CONTAINER_NAME'..."
+    docker rm "$MINIO_CONTAINER_NAME" >/dev/null 2>&1 || true
+  else
+    echo "No MinIO container named '$MINIO_CONTAINER_NAME' found."
+  fi
+
+  # Remove data and config
+  echo "Removing data and configuration directories..."
+  rm -rf "$MINIO_BASE_DIR"
+
+  echo "MinIO uninstallation completed."
+}
+
+# --- CLI Help --- #
+
+help() {
+  cat <<EOF
+########################################################################
+###                     MinIO Docker Installer                       ###
+########################################################################
+Usage: $0 [parameter]
+
+[Parameters]            | [Description]
+help                    | Display this help message
+install-minio           | Install and configure MinIO
+uninstall-minio         | Uninstall MinIO and remove data
+EOF
+}
+
+# --- Main CLI Wrapper --- #
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    help|--help|-h)
+      help
+      exit 0
+      ;;
+    install-minio)
+      check_root_privileges
+      echo "######################################"
+      echo "###     MinIO Installation Start   ###"
+      echo "######################################"
+      install_minio
+      exit 0
+      ;;
+    uninstall-minio)
+      check_root_privileges
+      echo "########################################"
+      echo "###     MinIO Uninstallation Start   ###"
+      echo "########################################"
+      uninstall_minio
+      exit 0
+      ;;
+    *)
+      echo "Invalid option: $1"
+      echo
+      help
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+help
