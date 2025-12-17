@@ -13,6 +13,7 @@ MINIO_VERSION=${MINIO_VERSION:-"latest"}        # e.g. "latest" or a specific re
 
 # Service identity / TLS
 MINIO_FQDN=${MINIO_FQDN:-"minio.edge.lab"}
+MINIO_WILDCARD_DOMAIN=${MINIO_WILDCARD_DOMAIN:-"*.edge.lab"}  # e.g. "*.example.com"
 
 # Bind address for local host (for dual-homed systems, etc.)
 BIND_ADDRESS=${BIND_ADDRESS:-"$(hostname -I | awk '{print $1}')"}  # IP to bind and use in SAN
@@ -114,26 +115,27 @@ validate_dns() {
 
 generate_certs() {
   echo "Creating self-signed certificate valid for $DURATION_DAYS days..."
-  mkdir -p "$MINIO_CERT_DIR"
+  mkdir -p "$MINIO_CERT_DIR/CAs"
+  mkdir -p "$base_dir/tmp_certs"
 
   # CA key + cert (for completeness, MinIO uses public/private only)
-  openssl genrsa -out "$MINIO_CERT_DIR/ca.key" 4096
+  openssl genrsa -out "$base_dir/tmp_certs/ca.key" 4096
   openssl req -x509 -new -nodes -sha512 -days "$DURATION_DAYS" \
-    -subj "/C=$COUNTRY/ST=$STATE/L=$LOCATION/O=$ORGANIZATION/CN=$MINIO_FQDN" \
-    -key "$MINIO_CERT_DIR/ca.key" \
-    -out "$MINIO_CERT_DIR/ca.crt"
+    -subj "/C=$COUNTRY/ST=$STATE/L=$LOCATION/O=$ORGANIZATION/CN=$MINIO_WILDCARD_DOMAIN" \
+    -key "$base_dir/tmp_certs/ca.key" \
+    -out "$base_dir/tmp_certs/ca.crt"
 
   # Server key
-  openssl genrsa -out "$MINIO_CERT_DIR/private.key" 4096
+  openssl genrsa -out "$base_dir/tmp_certs/private.key" 4096
 
   # CSR
   openssl req -sha512 -new \
-    -subj "/C=$COUNTRY/ST=$STATE/L=$LOCATION/O=$ORGANIZATION/CN=$MINIO_FQDN" \
-    -key "$MINIO_CERT_DIR/private.key" \
-    -out "$MINIO_CERT_DIR/minio.csr"
+    -subj "/C=$COUNTRY/ST=$STATE/L=$LOCATION/O=$ORGANIZATION/CN=$MINIO_WILDCARD_DOMAIN" \
+    -key "$base_dir/tmp_certs/private.key" \
+    -out "$base_dir/tmp_certs/minio.csr"
 
   # v3.ext for SANs
-  cat >"$MINIO_CERT_DIR/v3.ext" <<EOF
+  cat >"$base_dir/tmp_certs/v3.ext" <<EOF
 authorityKeyIdentifier=keyid,issuer
 basicConstraints=CA:FALSE
 keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
@@ -141,19 +143,26 @@ extendedKeyUsage = serverAuth
 subjectAltName = @alt_names
 
 [alt_names]
-DNS.1 = $MINIO_FQDN
-DNS.2 = $current_hostname
+DNS.1 = $MINIO_WILDCARD_DOMAIN
+DNS.2 = $MINIO_FQDN
+DNS.3 = $current_hostname
 IP.1  = $BIND_ADDRESS
 EOF
 
   # Signed cert -> public.crt (MinIO requires /certs/public.crt and /certs/private.key)
   openssl x509 -req -sha512 -days "$DURATION_DAYS" \
-    -extfile "$MINIO_CERT_DIR/v3.ext" \
-    -CA "$MINIO_CERT_DIR/ca.crt" \
-    -CAkey "$MINIO_CERT_DIR/ca.key" \
+    -extfile "$base_dir/tmp_certs/v3.ext" \
+    -CA "$base_dir/tmp_certs/ca.crt" \
+    -CAkey "$base_dir/tmp_certs/ca.key" \
     -CAcreateserial \
-    -in "$MINIO_CERT_DIR/minio.csr" \
-    -out "$MINIO_CERT_DIR/public.crt"
+    -in "$base_dir/tmp_certs/minio.csr" \
+    -out "$base_dir/tmp_certs/public.crt"
+
+  # Move certs to final location
+  cp "$base_dir/tmp_certs/public.crt" "$MINIO_CERT_DIR/public.crt"
+  cp "$base_dir/tmp_certs/private.key" "$MINIO_CERT_DIR/private.key"
+  cp "$base_dir/tmp_certs/ca.crt" "$MINIO_CERT_DIR/CAs/ca.crt"
+  chown -R 1000:1000 "$MINIO_CERT_DIR"
 
   echo "Certificate generation completed."
 }
@@ -165,14 +174,13 @@ generate_compose_file() {
   mkdir -p "$MINIO_BASE_DIR"
 
   cat >"$MINIO_COMPOSE_FILE" <<EOF
-version: "3.9"
-
 services:
   minio:
     image: minio/minio:${MINIO_VERSION}
     container_name: ${MINIO_CONTAINER_NAME}
+    hostname: ${current_hostname}
     restart: unless-stopped
-    command: server /data --console-address ":9001"
+    command: server /data --console-address ":9001" --certs-dir /certs
     environment:
       MINIO_ROOT_USER: "${MINIO_ROOT_USER}"
       MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD}"
@@ -192,7 +200,7 @@ start_minio_compose() {
   compose_cmd=$(get_compose_cmd) || exit 1
 
   mkdir -p "$MINIO_DATA_DIR"
-  mkdir -p "$MINIO_CERT_DIR"
+  chown -R 1000:1000 "$MINIO_DATA_DIR"
 
   if [[ -d "$MINIO_DATA_DIR/.minio.sys" ]]; then
     echo "NOTE: Existing MinIO data directory detected at '$MINIO_DATA_DIR'."
@@ -243,6 +251,8 @@ wait_for_minio() {
 
 # --- MinIO Client (mc) and Bucket Creation --- #
 
+# --- MinIO Client (mc) and Bucket Creation --- #
+
 configure_minio_and_bucket() {
   echo "Configuring MinIO with default bucket '$MINIO_DEFAULT_BUCKET'..."
   local s3_url="https://${MINIO_FQDN}:${MINIO_S3_PORT}"
@@ -252,27 +262,39 @@ configure_minio_and_bucket() {
     docker rm -f minio-mc >/dev/null 2>&1 || true
   fi
 
+  # FIX: Added --network host so the container shares the host's DNS and IP visibility
   docker run --rm \
+    --network host \
     --name minio-mc \
     --entrypoint /bin/sh \
     minio/mc \
     -c "
       set -e
 
-      mc alias set local '$s3_url' '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' --insecure >/dev/null 2>&1 || \
-        mc alias set local '$s3_url' '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' --api S3v4 --insecure
+      # Attempt to set alias (removed >/dev/null to allow visibility on error)
+      echo 'Setting mc alias...'
+      mc --insecure alias set local '$s3_url' '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD'
 
-      if ! mc ls local >/dev/null 2>&1; then
+      if ! mc --insecure ls local >/dev/null 2>&1; then
         echo 'ERROR: Failed to connect to MinIO using mc.'
         exit 1
       fi
 
-      if ! mc ls local/$MINIO_DEFAULT_BUCKET >/dev/null 2>&1; then
-        mc mb local/$MINIO_DEFAULT_BUCKET --ignore-existing >/dev/null 2>&1 || true
+      echo 'Ensuring bucket exists...'
+      if ! mc --insecure ls local/$MINIO_DEFAULT_BUCKET >/dev/null 2>&1; then
+        mc --insecure mb local/$MINIO_DEFAULT_BUCKET --ignore-existing
+      else
+        echo 'Bucket already exists.'
       fi
     "
 
-  echo "Default bucket '${MINIO_DEFAULT_BUCKET}' ensured."
+  # Check exit code of the docker run command to confirm success
+  if [ $? -eq 0 ]; then
+      echo "Default bucket '${MINIO_DEFAULT_BUCKET}' created."
+  else
+      echo "ERROR: Failed to configure MinIO bucket."
+      exit 1
+  fi
 }
 
 # --- Install / Uninstall Routines --- #
