@@ -10,6 +10,7 @@ DEBUG=${DEBUG:-1}
 
 # MinIO container version/tag
 MINIO_VERSION=${MINIO_VERSION:-"latest"}        # e.g. "latest" or a specific release
+MINIO_CLIENT_VERSION=${MINIO_CLIENT_VERSION:-"latest"}        # e.g. "latest" or a specific release
 
 # Service identity / TLS
 MINIO_FQDN=${MINIO_FQDN:-"minio.edge.lab"}
@@ -46,7 +47,18 @@ MINIO_COMPOSE_FILE=${MINIO_COMPOSE_FILE:-"$MINIO_BASE_DIR/docker-compose.yml"}
 MINIO_CONTAINER_NAME=${MINIO_CONTAINER_NAME:-"minio-server"}
 
 # --- INTERNAL VARIABLES (do not edit) --- #
-
+AIR_GAPPED_MODE=0
+SAVE_MODE=0
+INSTALL_MODE=0
+UNINSTALL_MODE=0
+REGISTRY_MODE=0
+REGISTRY_INFO=""
+REG_FQDN=""
+REG_PORT=""
+REG_USER=""
+REG_PASS=""
+fqdn_pattern='^([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$'
+ipv4_pattern='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
 base_dir=$(pwd)
 user_name=${SUDO_USER:-$(whoami)}
 mgmt_ip=$(hostname -I | awk '{print $1}')
@@ -72,6 +84,23 @@ check_root_privileges() {
     echo "This script must be run with sudo or as the root user."
     exit 1
   fi
+}
+
+os_check () {
+    # Get OS information from /etc/os-release
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        OS_ID_LIKE="${ID_LIKE:-}"
+        OS_ID="${ID:-}"
+    else
+        echo "Unknown or unsupported OS $OS_ID."
+        exit 1
+    fi
+    if [[ ! "$OS_ID" =~ ^(ubuntu|debian|rhel|centos|rocky|almalinux|fedora|sles|opensuse-leap)$ ]]; then
+        echo "Unknown or unsupported OS $OS_ID."
+        exit 1
+    fi
 }
 
 check_docker_installed() {
@@ -109,6 +138,21 @@ validate_dns() {
   else
     echo "DNS validation successful: '$MINIO_FQDN' -> '$dns_ip'."
   fi
+}
+
+display_args() {
+    echo "### MinIO Installer Started $(date) ###"
+    echo "  AIR_GAPPED_MODE: $AIR_GAPPED_MODE"
+    echo "  INSTALL_MODE: $INSTALL_MODE"
+    echo "  UNINSTALL_MODE: $UNINSTALL_MODE"
+    echo "  SAVE_MODE: $SAVE_MODE"
+    echo "  REGISTRY_MODE: $REGISTRY_MODE"
+    echo "  REGISTRY_INFO: $REGISTRY_INFO"
+    echo "  REG_FQDN: $REG_FQDN"
+    echo "  REG_PORT: $REG_PORT"
+    echo "  REG_USER: $REG_USER"
+    echo "  REG_PASS: $REG_PASS"
+    echo "  OS: $OS_ID"
 }
 
 # --- TLS Certificate Generation --- #
@@ -251,8 +295,6 @@ wait_for_minio() {
 
 # --- MinIO Client (mc) and Bucket Creation --- #
 
-# --- MinIO Client (mc) and Bucket Creation --- #
-
 configure_minio_and_bucket() {
   echo "Configuring MinIO with default bucket '$MINIO_DEFAULT_BUCKET'..."
   local s3_url="https://${MINIO_FQDN}:${MINIO_S3_PORT}"
@@ -267,7 +309,7 @@ configure_minio_and_bucket() {
     --network host \
     --name minio-mc \
     --entrypoint /bin/sh \
-    minio/mc \
+    minio/mc:${MINIO_CLIENT_VERSION} \
     -c "
       set -e
 
@@ -297,7 +339,7 @@ configure_minio_and_bucket() {
   fi
 }
 
-# --- Install / Uninstall Routines --- #
+# --- Routines --- #
 
 install_minio() {
   debug_run check_docker_installed
@@ -330,6 +372,10 @@ install_minio() {
   echo
 }
 
+offline_prep () {
+  echo "  Preparing MinIO offline archive..."
+}
+
 uninstall_minio() {
   echo "Uninstalling MinIO..."
 
@@ -351,50 +397,113 @@ uninstall_minio() {
 
 help() {
   cat <<EOF
-########################################################################
-###                     MinIO Docker Installer                       ###
-########################################################################
-Usage: $0 [parameter]
+Usage: $0 [command] [option]
 
-[Parameters]            | [Description]
-help                    | Display this help message
-install-minio           | Install and configure MinIO (Docker Compose)
-uninstall-minio         | Uninstall MinIO and remove data/config
+Commands:
+  help              | Display this help message
+  install           | Install and configure MinIO (Docker Compose)
+  save              | Prepare offline archive for air-gapped deployment
+  uninstall         | Uninstall MinIO and remove data/config
+
+Options:
+  -registry [url:port] [user] [password] | Push images to a local registry
 EOF
+  exit 1
 }
 
-# --- Main CLI Wrapper --- #
+# --- CLI Wrapper --- #
+
+check_root_privileges
+os_check
+if [[ "$#" -eq 0 ]]; then
+    echo "Error: No arguments provided."
+    help
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    help|--help|-h)
-      help
-      exit 0
+    help|--help|-h) help ;;
+    install)
+      INSTALL_MODE=1
+      shift
       ;;
-    install-minio)
-      check_root_privileges
-      echo "######################################"
-      echo "###     MinIO Installation Start   ###"
-      echo "######################################"
-      install_minio
-      exit 0
+    save)
+      SAVE_MODE=1
+      shift
       ;;
-    uninstall-minio)
-      check_root_privileges
-      echo "########################################"
-      echo "###     MinIO Uninstallation Start   ###"
-      echo "########################################"
-      uninstall_minio
-      exit 0
+    push)
+      PUSH_MODE=1
+      shift
+      ;;
+    uninstall)
+      UNINSTALL_MODE=1
+      shift
+      ;;
+    -registry)
+      REGISTRY_MODE=1
+      REGISTRY_INFO="${2:-}"
+      REG_USER="${3:-}"
+      REG_PASS="${4:-}"
+      if [[ -z "$REG_USER" || -z "$REG_PASS" ]]; then
+          echo "Error: Registry info requires a username and password. Format: -registry [registry:port username password]"
+          echo "Use '--help' for usage."
+          exit 1
+      fi
+      shift
+      shift
+      shift
+      shift
       ;;
     *)
-      echo "Invalid option: $1"
+      echo "Invalid argument: $1"
       echo
       help
-      exit 1
       ;;
   esac
   shift
 done
 
-help
+# -- Argument Validation -- #
+if [[ $INSTALL_MODE -eq 1 ]]; then 
+  if [[ $UNINSTALL_MODE -eq 1 || $SAVE_MODE -eq 1 ]]; then 
+    echo "Error: install, offline-prep, or uninstall cannot be used together."; exit 1; fi
+fi
+if [[ $UNINSTALL_MODE -eq 1 ]]; then 
+  if [[ $INSTALL_MODE -eq 1 || $SAVE_MODE -eq 1 ]]; then 
+    echo "Error: install, offline-prep, or uninstall cannot be used together.";exit 1; fi
+  if [[ $PUSH_MODE -eq 1 || $REGISTRY_MODE -eq 1 ]]; then
+    echo "Error: push or registry cannot be used with uninstall."; exit 1; fi
+fi
+if [[ $SAVE_MODE -eq 1 ]]; then 
+  if [[ $INSTALL_MODE -eq 1 || $UNINSTALL_MODE -eq 1 ]]; then 
+    echo "Error: install, offline-prep, or uninstall cannot be used together."; exit 1; fi
+  if [[ $PUSH_MODE -eq 1 || $REGISTRY_MODE -eq 1 ]]; then
+    echo "Error: push or registry cannot be used with save."; exit 1; fi
+fi
+if [[ $PUSH_MODE -eq 1 ]]; then 
+  if [[ $SAVE_MODE -eq 1 || $UNINSTALL_MODE -eq 1 ]]; then
+    echo "Error: save or uninstall cannot be used with push."; exit 1; fi
+fi
+[[ ! -f $base_dir/minio-save.tar.gz ]] || AIR_GAPPED_MODE=1
+
+# -- Main Logic -- #
+echo "### MinIO Installer Started - $(date) ###"
+display_args
+if [[ $AIR_GAPPED_MODE -eq 1 ]]; then
+  echo "  Extracting minio-save.tar.gz"
+  tar -xzf $base_dir/minio-save.tar.gz
+fi
+if [[ $INSTALL_MODE -eq 1 ]]; then
+  echo "###     MinIO Installation Starting"
+  install_minio
+fi
+if [[ $SAVE_MODE -eq 1 ]]; then
+  echo "###     MinIO Save Starting"
+  offline_prep
+fi
+if [[ $UNINSTALL_MODE -eq 1 ]]; then 
+  echo "###     MinIO Uninstallation Starting"
+  uninstall_minio
+fi
+echo "### MinIO Installer Finished - $(date) ###"
+
