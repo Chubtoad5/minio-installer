@@ -409,7 +409,9 @@ run_save () {
 minio/minio:${MINIO_VERSION}
 minio/mc:${MINIO_CLIENT_VERSION}
 EOF
+  cd $base_dir/utilities
   debug_run $base_dir/utilities/image_pull_push.sh -f $base_dir/utilities/images.txt save
+  cd $base_dir
   tar czf $base_dir/minio-save.tar.gz utilities minio-installer
 }
 
