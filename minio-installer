@@ -113,7 +113,7 @@ image_pull_push_check () {
 }
 
 
-check_docker_installed() {
+run_docker() {
   echo "  Verifying Docker Config..."
   if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
     image_pull_push_check
@@ -372,7 +372,7 @@ configure_minio_and_bucket() {
 # --- Routines --- #
 
 install_minio() {
-  debug_run check_docker_installed
+  debug_run run_docker
   debug_run validate_dns
   debug_run generate_certs
   debug_run generate_compose_file
@@ -404,6 +404,13 @@ install_minio() {
 
 run_save () {
   echo "  Preparing MinIO offline archive..."
+  debug_run image_pull_push_check
+  cat >$base_dir/utilities/images.txt <<EOF
+minio/minio:${MINIO_VERSION}
+minio/mc:${MINIO_CLIENT_VERSION}
+EOF
+  debug_run $base_dir/utilities/image_pull_push.sh -f $base_dir/utilities/images.txt save
+  tar czf $base_dir/minio-save.tar.gz utilities minio-installer
 }
 
 uninstall_minio() {
@@ -543,12 +550,11 @@ fi
 echo "### MinIO Installer Started - $(date) ###"
 display_args
 
-[[ -d $base_dir/utilities ]] || mkdir -p $base_dir/utilities
-
 if [[ $AIR_GAPPED_MODE -eq 1 ]]; then
   echo "  Extracting minio-save.tar.gz"
   tar -xzf $base_dir/minio-save.tar.gz
 fi
+[[ -d $base_dir/utilities ]] || mkdir -p $base_dir/utilities
 if [[ $INSTALL_MODE -eq 1 ]]; then
   echo "### MinIO Installation Starting ###"
   install_minio
