@@ -409,7 +409,7 @@ run_save () {
 uninstall_minio() {
   echo "  Uninstalling MinIO..."
 
-  stop_minio_compose
+  debug_run stop_minio_compose
 
   # Remove remaining container if still present
   if docker ps -a --format '{{.Names}}' | grep -q "^${MINIO_CONTAINER_NAME}\$"; then
@@ -419,7 +419,8 @@ uninstall_minio() {
 
   echo "  Removing MinIO directories under '$MINIO_BASE_DIR'..."
   rm -rf "$MINIO_BASE_DIR"
-
+  echo "  Removing tmp_certs and utilities directories..."
+  rm -rf "$base_dir/tmp_certs" "$base_dir/utilities"
   echo "  MinIO uninstallation completed."
 }
 
@@ -438,6 +439,13 @@ Commands:
 Options:
   push              | Push MinIO images to a local registry, must include -registry option
   -registry         | Registry credentials for pushing or pulling from local registry (Format: -registry [registry:port username password])
+
+Examples:
+  $0 install
+  $0 save
+  $0 uninstall
+  $0 install -registry myregistry:5000 user password
+  $0 install push -registry myregistry:5000 user password
 EOF
   exit 1
 }
@@ -542,16 +550,16 @@ if [[ $AIR_GAPPED_MODE -eq 1 ]]; then
   tar -xzf $base_dir/minio-save.tar.gz
 fi
 if [[ $INSTALL_MODE -eq 1 ]]; then
-  echo "## -- MinIO Installation Starting"
+  echo "### MinIO Installation Starting ###"
   install_minio
 fi
 if [[ $SAVE_MODE -eq 1 ]]; then
-  echo "## -- MinIO Save Starting"
+  echo "### MinIO Save Starting ###"
   run_save
 fi
 if [[ $UNINSTALL_MODE -eq 1 ]]; then 
-  echo "## -- MinIO Uninstallation Starting"
+  echo "### MinIO Uninstallation Starting ###"
   uninstall_minio
 fi
-echo "## -- MinIO Installer Finished - $(date) ###"
+echo "### MinIO Installer Finished - $(date) ###"
 
