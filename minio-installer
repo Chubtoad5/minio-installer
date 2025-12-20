@@ -412,9 +412,6 @@ EOF
 }
 
 # --- CLI Wrapper --- #
-
-check_root_privileges
-os_check
 if [[ "$#" -eq 0 ]]; then
     echo "Error: No arguments provided."
     help
@@ -457,11 +454,13 @@ while [[ $# -gt 0 ]]; do
     *)
       echo "Invalid argument: $1"
       echo
-      help
       ;;
   esac
   shift
 done
+
+check_root_privileges
+os_check
 
 # -- Argument Validation -- #
 if [[ $INSTALL_MODE -eq 1 ]]; then 
@@ -487,6 +486,7 @@ fi
 [[ ! -f $base_dir/minio-save.tar.gz ]] || AIR_GAPPED_MODE=1
 
 # -- Main Logic -- #
+
 echo "### MinIO Installer Started - $(date) ###"
 display_args
 if [[ $AIR_GAPPED_MODE -eq 1 ]]; then
