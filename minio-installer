@@ -27,8 +27,8 @@ ORGANIZATION=${ORGANIZATION:-"SELF"}
 DURATION_DAYS=${DURATION_DAYS:-"3650"}
 
 # MinIO admin credentials
-MINIO_ROOT_USER=${MINIO_ROOT_USER:-"minioadmin"}
-MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-"minioadmin123"}
+MINIO_ROOT_USER=${MINIO_ROOT_USER:-"admin"}
+MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-"changeme"}
 
 # Default bucket config
 MINIO_DEFAULT_BUCKET=${MINIO_DEFAULT_BUCKET:-"default-bucket"}
@@ -41,7 +41,7 @@ MINIO_CONSOLE_PORT=${MINIO_CONSOLE_PORT:-"9001"}
 MINIO_BASE_DIR=${MINIO_BASE_DIR:-"/opt/minio"}
 MINIO_DATA_DIR=${MINIO_DATA_DIR:-"$MINIO_BASE_DIR/data"}
 MINIO_CERT_DIR=${MINIO_CERT_DIR:-"$MINIO_BASE_DIR/certs"}
-MINIO_COMPOSE_FILE=${MINIO_COMPOSE_FILE:-"$MINIO_BASE_DIR/docker-compose.yml"}
+MINIO_COMPOSE_FILE=${MINIO_COMPOSE_FILE:-"$MINIO_BASE_DIR/minio-compose.yml"}
 
 # Container names
 MINIO_CONTAINER_NAME=${MINIO_CONTAINER_NAME:-"minio-server"}
@@ -51,6 +51,7 @@ AIR_GAPPED_MODE=0
 SAVE_MODE=0
 INSTALL_MODE=0
 UNINSTALL_MODE=0
+PUSH_MODE=0
 REGISTRY_MODE=0
 REGISTRY_INFO=""
 REG_FQDN=""
@@ -103,40 +104,63 @@ os_check () {
     fi
 }
 
-check_docker_installed() {
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "Error: docker is not installed or not in PATH."
-    echo "Please install Docker before running this script."
-    exit 1
-  fi
+image_pull_push_check () {
+    if [[ ! -f $base_dir/utilities/image_pull_push.sh ]]; then
+        echo "  Downloading image_pull_push.sh..."
+        curl -sfL https://github.com/Chubtoad5/images-pull-push/raw/refs/heads/main/image_pull_push.sh  -o $base_dir/utilities/image_pull_push.sh
+        chmod +x $base_dir/utilities/image_pull_push.sh
+    fi
 }
 
-get_compose_cmd() {
-  if docker compose version >/dev/null 2>&1; then
-    echo "docker compose"
-  elif command -v docker-compose >/dev/null 2>&1; then
-    echo "docker-compose"
+
+check_docker_installed() {
+  echo "  Verifying Docker Config..."
+  if [[ $AIR_GAPPED_MODE -eq 0 ]]; then
+    image_pull_push_check
+    if [[ $PUSH_MODE -eq 1 ]]; then
+      cat >$base_dir/utilities/images.txt <<EOF
+minio/minio:${MINIO_VERSION}
+minio/mc:${MINIO_CLIENT_VERSION}
+EOF
+      $base_dir/utilities/image_pull_push.sh -f $base_dir/utilities/images.txt push $REGISTRY_INFO $REG_USER $REG_PASS
+    else
+      $base_dir/utilities/image_pull_push.sh docker
+      # Still grab registry cert if needed
+      if [[ $REGISTRY_MODE -eq 1 ]]; then
+        $base_dir/utilities/image_pull_push.sh reg-cert $REGISTRY_INFO
+      fi
+    fi
   else
-    echo "Error: docker compose (plugin) or docker-compose (standalone) is required." >&2
-    return 1
+    # AIR_GAPPED_MODE is set
+    for file in "$base_dir/utilities/container_images_*.tar.gz"; do
+      if [[ $PUSH_MODE -eq 1 ]]; then
+        $base_dir/utilities/image_pull_push.sh -f $file push $REGISTRY_INFO $REG_USER $REG_PASS
+      else
+        $base_dir/utilities/image_pull_push.sh -f $file keep
+      fi
+    done
+    # Still grab registry cert if needed
+    if [[ $REGISTRY_MODE -eq 1 ]]; then
+      $base_dir/utilities/image_pull_push.sh reg-cert $REGISTRY_INFO
+    fi
   fi
 }
 
 validate_dns() {
-  echo "Validating DNS for '$MINIO_FQDN' against bind address '$BIND_ADDRESS'..."
+  echo "  Validating DNS for '$MINIO_FQDN' against bind address '$BIND_ADDRESS'..."
   local dns_ip
   dns_ip=$(getent ahosts "$MINIO_FQDN" 2>/dev/null | awk '/STREAM/ {print $1; exit}')
 
   if [[ -z "$dns_ip" ]]; then
-    echo "WARNING: DNS lookup for '$MINIO_FQDN' failed. The name may not be resolvable."
+    echo "  WARNING: DNS lookup for '$MINIO_FQDN' failed. The name may not be resolvable."
     return 0
   fi
 
   if [[ "$dns_ip" != "$BIND_ADDRESS" ]]; then
-    echo "WARNING: DNS for '$MINIO_FQDN' resolves to '$dns_ip' but bind address is '$BIND_ADDRESS'."
-    echo "Clients may not be able to reach MinIO using the configured FQDN."
+    echo "  WARNING: DNS for '$MINIO_FQDN' resolves to '$dns_ip' but bind address is '$BIND_ADDRESS'."
+    echo "  Clients may not be able to reach MinIO using the configured FQDN."
   else
-    echo "DNS validation successful: '$MINIO_FQDN' -> '$dns_ip'."
+    echo "  DNS validation successful: '$MINIO_FQDN' -> '$dns_ip'."
   fi
 }
 
@@ -145,6 +169,8 @@ display_args() {
     echo "  AIR_GAPPED_MODE: $AIR_GAPPED_MODE"
     echo "  INSTALL_MODE: $INSTALL_MODE"
     echo "  UNINSTALL_MODE: $UNINSTALL_MODE"
+    echo "  DEBUG: $DEBUG"
+    echo "  PUSH_MODE: $PUSH_MODE"
     echo "  SAVE_MODE: $SAVE_MODE"
     echo "  REGISTRY_MODE: $REGISTRY_MODE"
     echo "  REGISTRY_INFO: $REGISTRY_INFO"
@@ -158,7 +184,7 @@ display_args() {
 # --- TLS Certificate Generation --- #
 
 generate_certs() {
-  echo "Creating self-signed certificate valid for $DURATION_DAYS days..."
+  echo "  Creating self-signed certificate valid for $DURATION_DAYS days..."
   mkdir -p "$MINIO_CERT_DIR/CAs"
   mkdir -p "$base_dir/tmp_certs"
 
@@ -208,19 +234,24 @@ EOF
   cp "$base_dir/tmp_certs/ca.crt" "$MINIO_CERT_DIR/CAs/ca.crt"
   chown -R 1000:1000 "$MINIO_CERT_DIR"
 
-  echo "Certificate generation completed."
+  echo "  Certificate generation completed."
 }
 
 # --- Docker Compose Configuration --- #
 
 generate_compose_file() {
-  echo "Generating docker-compose.yml at $MINIO_COMPOSE_FILE ..."
+  echo "  Generating minio-compose.yml at $MINIO_COMPOSE_FILE ..."
   mkdir -p "$MINIO_BASE_DIR"
+  if [[ $REGISTRY_MODE -eq 1 ]]; then
+    local image="${REG_FQDN}:${REG_PORT}/minio/minio:${MINIO_VERSION}"
+  else
+    local image="minio/minio:${MINIO_VERSION}"
+  fi
 
   cat >"$MINIO_COMPOSE_FILE" <<EOF
 services:
   minio:
-    image: minio/minio:${MINIO_VERSION}
+    image: $image
     container_name: ${MINIO_CONTAINER_NAME}
     hostname: ${current_hostname}
     restart: unless-stopped
@@ -240,35 +271,29 @@ EOF
 }
 
 start_minio_compose() {
-  local compose_cmd
-  compose_cmd=$(get_compose_cmd) || exit 1
-
   mkdir -p "$MINIO_DATA_DIR"
   chown -R 1000:1000 "$MINIO_DATA_DIR"
 
   if [[ -d "$MINIO_DATA_DIR/.minio.sys" ]]; then
-    echo "NOTE: Existing MinIO data directory detected at '$MINIO_DATA_DIR'."
-    echo "      Existing credentials/config will be preserved. New MINIO_ROOT_USER/PASSWORD may be ignored."
+    echo "  NOTE: Existing MinIO data directory detected at '$MINIO_DATA_DIR'."
+    echo "        Existing credentials/config will be preserved. New MINIO_ROOT_USER/PASSWORD may be ignored."
   fi
 
-  echo "Starting MinIO using Docker Compose..."
-  (cd "$MINIO_BASE_DIR" && $compose_cmd up -d)
+  echo "  Starting MinIO using Docker Compose..."
+  (docker compose -f "$MINIO_COMPOSE_FILE" up -d)
 }
 
 stop_minio_compose() {
-  local compose_cmd
-  compose_cmd=$(get_compose_cmd) || return 0
-
   if [[ -f "$MINIO_COMPOSE_FILE" ]]; then
-    echo "Stopping MinIO using Docker Compose..."
-    (cd "$MINIO_BASE_DIR" && $compose_cmd down || true)
+    echo "  Stopping MinIO using Docker Compose..."
+    (docker compose -f "$MINIO_COMPOSE_FILE" down || true)
   fi
 }
 
 # --- Health Check --- #
 
 wait_for_minio() {
-  echo "Waiting for MinIO to become ready (HTTPS)..."
+  echo "  Waiting for MinIO to become ready (HTTPS)..."
   local retries=60
   local delay=5
   local i=0
@@ -281,7 +306,7 @@ wait_for_minio() {
     code=$(curl -k -s -o /dev/null -w "%{http_code}" "$health_url" || echo "000")
 
     if [[ "$code" == "200" ]]; then
-      echo "MinIO reports ready (HTTP $code)."
+      echo "  MinIO reports ready (HTTP $code)."
       return 0
     fi
 
@@ -290,14 +315,19 @@ wait_for_minio() {
     sleep "$delay"
   done
 
-  echo "WARNING: MinIO did not become healthy within the expected time. mc operations may fail."
+  echo "  WARNING: MinIO did not become healthy within the expected time. mc operations may fail."
 }
 
 # --- MinIO Client (mc) and Bucket Creation --- #
 
 configure_minio_and_bucket() {
-  echo "Configuring MinIO with default bucket '$MINIO_DEFAULT_BUCKET'..."
+  echo "  Configuring MinIO with default bucket '$MINIO_DEFAULT_BUCKET'..."
   local s3_url="https://${MINIO_FQDN}:${MINIO_S3_PORT}"
+  if [[ $REGISTRY_MODE -eq 1 ]]; then
+    local image="${REG_FQDN}:${REG_PORT}/minio/mc:${MINIO_CLIENT_VERSION}"
+  else
+    local image="minio/mc:${MINIO_CLIENT_VERSION}"
+  fi
 
   # Remove any stale mc container
   if docker ps -a --format '{{.Names}}' | grep -q "^minio-mc\$"; then
@@ -309,32 +339,32 @@ configure_minio_and_bucket() {
     --network host \
     --name minio-mc \
     --entrypoint /bin/sh \
-    minio/mc:${MINIO_CLIENT_VERSION} \
+    $image \
     -c "
       set -e
 
       # Attempt to set alias (removed >/dev/null to allow visibility on error)
-      echo 'Setting mc alias...'
+      echo '  Setting mc alias...'
       mc --insecure alias set local '$s3_url' '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD'
 
       if ! mc --insecure ls local >/dev/null 2>&1; then
-        echo 'ERROR: Failed to connect to MinIO using mc.'
+        echo '  ERROR: Failed to connect to MinIO using mc.'
         exit 1
       fi
 
-      echo 'Ensuring bucket exists...'
+      echo '  Ensuring bucket exists...'
       if ! mc --insecure ls local/$MINIO_DEFAULT_BUCKET >/dev/null 2>&1; then
         mc --insecure mb local/$MINIO_DEFAULT_BUCKET --ignore-existing
       else
-        echo 'Bucket already exists.'
+        echo '  Bucket already exists.'
       fi
     "
 
   # Check exit code of the docker run command to confirm success
   if [ $? -eq 0 ]; then
-      echo "Default bucket '${MINIO_DEFAULT_BUCKET}' created."
+      echo "  Default bucket '${MINIO_DEFAULT_BUCKET}' created."
   else
-      echo "ERROR: Failed to configure MinIO bucket."
+      echo "  ERROR: Failed to configure MinIO bucket."
       exit 1
   fi
 }
@@ -372,25 +402,25 @@ install_minio() {
   echo
 }
 
-offline_prep () {
+run_save () {
   echo "  Preparing MinIO offline archive..."
 }
 
 uninstall_minio() {
-  echo "Uninstalling MinIO..."
+  echo "  Uninstalling MinIO..."
 
   stop_minio_compose
 
   # Remove remaining container if still present
   if docker ps -a --format '{{.Names}}' | grep -q "^${MINIO_CONTAINER_NAME}\$"; then
-    echo "Removing MinIO container '$MINIO_CONTAINER_NAME'..."
+    echo "  Removing MinIO container '$MINIO_CONTAINER_NAME'..."
     docker rm -f "$MINIO_CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
 
-  echo "Removing MinIO directories under '$MINIO_BASE_DIR'..."
+  echo "  Removing MinIO directories under '$MINIO_BASE_DIR'..."
   rm -rf "$MINIO_BASE_DIR"
 
-  echo "MinIO uninstallation completed."
+  echo "  MinIO uninstallation completed."
 }
 
 # --- CLI Help --- #
@@ -406,7 +436,8 @@ Commands:
   uninstall         | Uninstall MinIO and remove data/config
 
 Options:
-  -registry [url:port] [user] [password] | Push images to a local registry
+  push              | Push MinIO images to a local registry, must include -registry option
+  -registry         | Registry credentials for pushing or pulling from local registry (Format: -registry [registry:port username password])
 EOF
   exit 1
 }
@@ -422,19 +453,15 @@ while [[ $# -gt 0 ]]; do
     help|--help|-h) help ;;
     install)
       INSTALL_MODE=1
-      shift
       ;;
     save)
       SAVE_MODE=1
-      shift
       ;;
     push)
       PUSH_MODE=1
-      shift
       ;;
     uninstall)
       UNINSTALL_MODE=1
-      shift
       ;;
     -registry)
       REGISTRY_MODE=1
@@ -446,10 +473,7 @@ while [[ $# -gt 0 ]]; do
           echo "Use '--help' for usage."
           exit 1
       fi
-      shift
-      shift
-      shift
-      shift
+      shift 3
       ;;
     *)
       echo "Invalid argument: $1"
@@ -483,27 +507,51 @@ if [[ $PUSH_MODE -eq 1 ]]; then
   if [[ $SAVE_MODE -eq 1 || $UNINSTALL_MODE -eq 1 ]]; then
     echo "Error: save or uninstall cannot be used with push."; exit 1; fi
 fi
+if [[ "$REGISTRY_MODE" == "1" ]]; then
+    if [[ "$REGISTRY_INFO" =~ ^https?:// ]]; then
+        echo "Error: registry info must be a valid FQDN or IPv4 format. i.e. 'my.regsitry.com:443'."
+        exit 1
+    fi
+    REG_FQDN=$(echo "$REGISTRY_INFO" | cut -d':' -f1)
+    REG_PORT=$(echo "$REGISTRY_INFO" | cut -d':' -f2)
+    if [[ ! ( "$REG_FQDN" =~ $fqdn_pattern || "$REG_FQDN" =~ $ipv4_pattern ) ]]; then
+        echo "Error: Registry url must be a valid FQDN or IPv4 format. i.e. 'my.regsitry.com' or '192.168.1.50'."
+        exit 1
+    fi
+    if [[ "$REG_PORT" =~ ^[0-9]+$ ]]; then
+        if [[ "$REG_PORT" -lt 1 || "$REG_PORT" -gt 65535 ]]; then
+            echo "Error: Registry port must be a number between 1 and 65535."
+            exit 1
+        fi
+    else
+        echo "Error: Registry port must be a number between 1 and 65535."
+        exit 1
+    fi
+fi
 [[ ! -f $base_dir/minio-save.tar.gz ]] || AIR_GAPPED_MODE=1
 
 # -- Main Logic -- #
 
 echo "### MinIO Installer Started - $(date) ###"
 display_args
+
+[[ -d $base_dir/utilities ]] || mkdir -p $base_dir/utilities
+
 if [[ $AIR_GAPPED_MODE -eq 1 ]]; then
   echo "  Extracting minio-save.tar.gz"
   tar -xzf $base_dir/minio-save.tar.gz
 fi
 if [[ $INSTALL_MODE -eq 1 ]]; then
-  echo "###     MinIO Installation Starting"
+  echo "## -- MinIO Installation Starting"
   install_minio
 fi
 if [[ $SAVE_MODE -eq 1 ]]; then
-  echo "###     MinIO Save Starting"
-  offline_prep
+  echo "## -- MinIO Save Starting"
+  run_save
 fi
 if [[ $UNINSTALL_MODE -eq 1 ]]; then 
-  echo "###     MinIO Uninstallation Starting"
+  echo "## -- MinIO Uninstallation Starting"
   uninstall_minio
 fi
-echo "### MinIO Installer Finished - $(date) ###"
+echo "## -- MinIO Installer Finished - $(date) ###"
 
