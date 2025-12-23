@@ -30,8 +30,9 @@ DURATION_DAYS=${DURATION_DAYS:-"3650"}
 MINIO_ROOT_USER=${MINIO_ROOT_USER:-"admin"}
 MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-"changeme"}
 
-# Default bucket config
+# Default bucket and bulk downloadconfig
 MINIO_DEFAULT_BUCKET=${MINIO_DEFAULT_BUCKET:-"default-bucket"}
+BULK_DOWNLOAD_URLS=${BULK_DOWNLOAD_URLS:-"https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64-disk-kvm.img" "https://github.com/tme-tech-lab/infra-dev-apps/archive/refs/heads/main.zip"}
 
 # Ports
 MINIO_S3_PORT=${MINIO_S3_PORT:-"9000"}
@@ -52,6 +53,7 @@ SAVE_MODE=0
 INSTALL_MODE=0
 UNINSTALL_MODE=0
 PUSH_MODE=0
+BULK_UPLOAD=0
 REGISTRY_MODE=0
 REGISTRY_INFO=""
 REG_FQDN=""
@@ -369,6 +371,64 @@ configure_minio_and_bucket() {
   fi
 }
 
+upload_files () { 
+  # checks for files to download locally then upload to S3 bucket
+  echo "  Checking for bulk file download..."
+  read -a BULK_DOWNLOAD_ARRAY <<< "$BULK_DOWNLOAD_URLS"
+  if [[ -z "${BULK_DOWNLOAD_ARRAY[*]}" ]]; then
+      echo "  No bulk file download URLs provided, skipping."
+      return 0
+  else
+    BULK_UPLOAD=1
+    mkdir -p "$base_dir/upload" || true
+    echo "  Downloading bulk files..."
+    for file in "${BULK_DOWNLOAD_ARRAY[@]}"; do
+      echo "    Downloading: $(basename "$file")"
+      curl -ksfL "$file" -o "$base_dir/upload/$(basename "$file")"
+    done
+  fi
+  if [[ $BULK_UPLOAD -eq 1 ]]; then
+      bulk-upload "$base_dir/upload" "$MINIO_DEFAULT_BUCKET"
+  fi
+}
+
+bulk-upload() {
+    local source_dir="$1"
+    local target_bucket="${2:-default-bucket}" # Defaults to 'default-bucket'
+    
+    # Verify directory exists
+    if [[ ! -d "$source_dir" ]]; then
+        echo "Error: Directory '$source_dir' not found."
+        return 1
+    fi
+
+    echo "Starting bulk upload from '$source_dir' to bucket '$target_bucket'..."
+
+    # Run ephemeral mc container
+    # 1. Mount source_dir to /upload
+    # 2. Configure alias
+    # 3. Use find to create a loop for all files (skipping directories)
+    docker run --rm \
+        --network host \
+        -v "$(realpath "$source_dir"):/upload" \
+        -e MINIO_ROOT_USER="$MINIO_ROOT_USER" \
+        -e MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
+        minio/mc \
+        sh -c "
+            # Set alias (suppress output for cleaner logs)
+            mc --insecure alias set local https://${MINIO_FQDN}:${MINIO_S3_PORT} \$MINIO_ROOT_USER \$MINIO_ROOT_PASSWORD > /dev/null;
+
+            # Loop through all files in /upload
+            # -type f ensures we only upload files, not subdirectories themselves
+            echo 'Processing files...'
+            find /upload -maxdepth 1 -type f | while read file; do
+                filename=\$(basename \"\$file\")
+                echo \"Uploading \$filename...\"
+                mc --insecure cp \"\$file\" \"local/$target_bucket/\$filename\"
+            done
+        "
+}
+
 # --- Routines --- #
 
 install_minio() {
@@ -379,6 +439,7 @@ install_minio() {
   debug_run start_minio_compose
   debug_run wait_for_minio
   debug_run configure_minio_and_bucket
+  debug_run upload_files
 
   local console_url="https://${MINIO_FQDN}:${MINIO_CONSOLE_PORT}"
   local s3_url="https://${MINIO_FQDN}:${MINIO_S3_PORT}/${MINIO_DEFAULT_BUCKET}"
