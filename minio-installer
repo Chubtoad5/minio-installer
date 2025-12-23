@@ -407,8 +407,8 @@ bulk-upload() {
     # Run ephemeral mc container
     # 1. Mount source_dir to /upload
     # 2. Configure alias
-    # 3. Use find to create a loop for all files (skipping directories)
-    docker run --rm \
+    # 3. use mc mirror to upload files to s3 bucket
+docker run --rm \
         --network host \
         --entrypoint /bin/sh \
         -v "$(realpath "$source_dir"):/upload" \
@@ -416,17 +416,12 @@ bulk-upload() {
         -e MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
         minio/mc \
         -c "
-            # Set alias (suppress output for cleaner logs)
-            mc --insecure alias set local https://${MINIO_FQDN}:${MINIO_S3_PORT} \$MINIO_ROOT_USER \$MINIO_ROOT_PASSWORD > /dev/null;
+            # Set alias using internal quotes to protect passwords with special chars
+            mc --insecure alias set local https://${MINIO_FQDN}:${MINIO_S3_PORT} \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" > /dev/null;
 
-            # Loop through all files in /upload
-            # -type f ensures we only upload files, not subdirectories themselves
-            echo 'Processing files...'
-            find /upload -maxdepth 1 -type f | while read file; do
-                filename=\$(basename \"\$file\")
-                echo \"Uploading \$filename...\"
-                mc --insecure cp \"\$file\" \"local/$target_bucket/\$filename\"
-            done
+            echo 'Starting synchronization...'
+            # Use mirror for performance; trailing slash on /upload/ copies CONTENTS, not the folder
+            mc --insecure mirror --quiet /upload/ \"local/$target_bucket/\"
         "
 }
 
