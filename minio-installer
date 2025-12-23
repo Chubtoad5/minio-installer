@@ -410,11 +410,12 @@ bulk-upload() {
     # 3. Use find to create a loop for all files (skipping directories)
     docker run --rm \
         --network host \
+        --entrypoint /bin/sh \
         -v "$(realpath "$source_dir"):/upload" \
         -e MINIO_ROOT_USER="$MINIO_ROOT_USER" \
         -e MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD" \
         minio/mc \
-        sh -c "
+        -c "
             # Set alias (suppress output for cleaner logs)
             mc --insecure alias set local https://${MINIO_FQDN}:${MINIO_S3_PORT} \$MINIO_ROOT_USER \$MINIO_ROOT_PASSWORD > /dev/null;
 
