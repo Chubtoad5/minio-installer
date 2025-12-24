@@ -1,9 +1,20 @@
 # minio-installer
 Minio container installer for linux based systems
 
+# Core Features
+
+- Automate MinIO pre-requisites (docker, self-signed certificates)
+- Automate single-node MinIO container install based on user defined variables
+- Loads mc container for local management
+- Create a default bucket
+- Download files locally and mirror to specified bucket
+- Create an offline archive for air-gapped installations
+- Support for pushing containers to a local registry
+- Support for pulling containers from local registry
+
 
 # Usage
-
+```
 Usage: ./minio-installer [command] [option]
 
 Commands:
@@ -22,3 +33,4 @@ Examples:
   $0 uninstall
   $0 install -registry myregistry:5000 user password
   $0 install push -registry myregistry:5000 user password
+  ```

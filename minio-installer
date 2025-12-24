@@ -371,44 +371,37 @@ configure_minio_and_bucket() {
   fi
 }
 
-upload_files () { 
+bulk_download () {
+  mkdir -p "$base_dir/upload" || true
   # checks for files to download locally then upload to S3 bucket
+  [[ $AIR_GAPPED_MODE -eq 0 ]] || return 0
   echo "  Checking for bulk file download..."
   read -a BULK_DOWNLOAD_ARRAY <<< "$BULK_DOWNLOAD_URLS"
   if [[ -z "${BULK_DOWNLOAD_ARRAY[*]}" ]]; then
       echo "  No bulk file download URLs provided, skipping."
       return 0
   else
-    BULK_UPLOAD=1
-    mkdir -p "$base_dir/upload" || true
-    echo "  Downloading bulk files..."
     for file in "${BULK_DOWNLOAD_ARRAY[@]}"; do
-      echo "    Downloading: $(basename "$file")"
+      echo "  Downloading: $(basename "$file")"
       curl -ksfL "$file" -o "$base_dir/upload/$(basename "$file")"
     done
   fi
-  if [[ $BULK_UPLOAD -eq 1 ]]; then
-      bulk-upload "$base_dir/upload" "$MINIO_DEFAULT_BUCKET"
-  fi
 }
 
-bulk-upload() {
+bulk_upload() {
     local source_dir="$1"
     local target_bucket="${2:-default-bucket}" # Defaults to 'default-bucket'
     
-    # Verify directory exists
     if [[ ! -d "$source_dir" ]]; then
-        echo "Error: Directory '$source_dir' not found."
-        return 1
+        echo "  Directory '$source_dir' not found, skipping bulk upload."
+        return 0
     fi
-
-    echo "Starting bulk upload from '$source_dir' to bucket '$target_bucket'..."
-
-    # Run ephemeral mc container
-    # 1. Mount source_dir to /upload
-    # 2. Configure alias
-    # 3. use mc mirror to upload files to s3 bucket
-docker run --rm \
+    if [[ -z "ls -A $source_dir" ]]; then
+        echo "  Directory '$source_dir' is empty, skipping bulk upload."
+        return 0
+    fi
+    echo "  Starting bulk upload from '$source_dir' to bucket '$target_bucket'..."
+    docker run --rm \
         --network host \
         --entrypoint /bin/sh \
         -v "$(realpath "$source_dir"):/upload" \
@@ -418,8 +411,7 @@ docker run --rm \
         -c "
             # Set alias using internal quotes to protect passwords with special chars
             mc --insecure alias set local https://${MINIO_FQDN}:${MINIO_S3_PORT} \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" > /dev/null;
-
-            echo 'Starting synchronization...'
+            echo '  Starting synchronization...'
             # Use mirror for performance; trailing slash on /upload/ copies CONTENTS, not the folder
             mc --insecure mirror --quiet /upload/ \"local/$target_bucket/\"
         "
@@ -435,7 +427,8 @@ install_minio() {
   debug_run start_minio_compose
   debug_run wait_for_minio
   debug_run configure_minio_and_bucket
-  debug_run upload_files
+  debug_run bulk_download
+  debug_run bulk_upload "$base_dir/upload" "$MINIO_DEFAULT_BUCKET"
 
   local console_url="https://${MINIO_FQDN}:${MINIO_CONSOLE_PORT}"
   local s3_url="https://${MINIO_FQDN}:${MINIO_S3_PORT}/${MINIO_DEFAULT_BUCKET}"
@@ -446,8 +439,6 @@ install_minio() {
   echo "  Bind Address:          $BIND_ADDRESS"
   echo "  FQDN:                  $MINIO_FQDN"
   echo "  Data Directory:        $MINIO_DATA_DIR"
-  echo "  Certificates Directory:$MINIO_CERT_DIR"
-  echo "  Compose File:          $MINIO_COMPOSE_FILE"
   echo
   echo "  Console URL:           $console_url"
   echo "  S3 Endpoint URL:       $s3_url"
@@ -469,7 +460,8 @@ EOF
   cd $base_dir/utilities
   debug_run ./image_pull_push.sh -f $base_dir/utilities/images.txt save
   cd $base_dir
-  tar czf $base_dir/minio-save.tar.gz utilities minio-installer
+  debug_run bulk_download
+  tar czf $base_dir/minio-save.tar.gz utilities minio-installer upload
 }
 
 uninstall_minio() {
