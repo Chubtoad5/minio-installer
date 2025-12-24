@@ -461,6 +461,7 @@ EOF
   cd $base_dir
   debug_run bulk_download
   tar czf $base_dir/minio-save.tar.gz utilities minio-installer upload
+  echo "  created 'minio-save.tar.gz' for air-gapped deployment."
 }
 
 uninstall_minio() {
@@ -475,9 +476,9 @@ uninstall_minio() {
   fi
 
   echo "  Removing MinIO directories under '$MINIO_BASE_DIR'..."
-  rm -rf "$MINIO_BASE_DIR"
+  rm -rf "$MINIO_BASE_DIR" || true
   echo "  Removing tmp_certs and utilities directories..."
-  rm -rf "$base_dir/tmp_certs" "$base_dir/utilities"
+  rm -rf "$base_dir/tmp_certs" "$base_dir/utilities" "$base_dir/upload" || true
   echo "  MinIO uninstallation completed."
 }
 
