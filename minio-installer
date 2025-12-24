@@ -32,7 +32,7 @@ MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-"changeme"}
 
 # Default bucket and bulk downloadconfig
 MINIO_DEFAULT_BUCKET=${MINIO_DEFAULT_BUCKET:-"default-bucket"}
-BULK_DOWNLOAD_URLS=${BULK_DOWNLOAD_URLS:-"https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64-disk-kvm.img" "https://github.com/tme-tech-lab/infra-dev-apps/archive/refs/heads/main.zip"}
+BULK_DOWNLOAD_URLS=${BULK_DOWNLOAD_URLS:-""} # space separated URLs, e.g. "https://example.com/path/to/file1.img https://example.com/path/to/file2.zip"
 
 # Ports
 MINIO_S3_PORT=${MINIO_S3_PORT:-"9000"}
@@ -53,7 +53,6 @@ SAVE_MODE=0
 INSTALL_MODE=0
 UNINSTALL_MODE=0
 PUSH_MODE=0
-BULK_UPLOAD=0
 REGISTRY_MODE=0
 REGISTRY_INFO=""
 REG_FQDN=""
