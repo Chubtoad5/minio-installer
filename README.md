@@ -28,9 +28,9 @@ Options:
   -registry         | Registry credentials for pushing or pulling from local registry (Format: -registry [registry:port username password])
 
 Examples:
-  $0 install
-  $0 save
-  $0 uninstall
-  $0 install -registry myregistry:5000 user password
-  $0 install push -registry myregistry:5000 user password
+  ./minio-installer install
+  ./minio-installer save
+  ./minio-installer uninstall
+  ./minio-installer install -registry myregistry:5000 user password
+  ./minio-installer install push -registry myregistry:5000 user password
   ```
